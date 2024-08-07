@@ -14,23 +14,20 @@ const config = {
 
   // Set the production url of your site here
   url: 'https://jonafk555.github.io',
-  baseUrl: '/my-blog',
-
-  // GitHub pages deployment config.
-  // If you aren't using GitHub pages, you don't need these.
+  baseUrl: '/',
   organizationName: 'jonafk555', // Usually your GitHub org/user name.
   projectName: 'jonafk555.github.io', // Usually your repo name.
-
   onBrokenLinks: 'throw',
   onBrokenMarkdownLinks: 'warn',
+  deploymentBranch: 'main',
 
   // Even if you don't use internationalization, you can use this field to set
   // useful metadata like html lang. For example, if your site is Chinese, you
   // may want to replace "en" with "zh-Hans".
-  i18n: {
-    defaultLocale: 'zh-TW',
-    locales: ['en', 'zh-TW'],
-  },
+  // i18n: {
+    // defaultLocale: 'en',
+    // locales: ['en'],
+    // } ,
 
   presets: [
     [
