@@ -43,6 +43,16 @@
   .field input:focus,.field select:focus,textarea:focus{border-color:var(--blue)}
   .field .hint{font-size:11px;color:var(--faint);margin-top:5px;font-family:var(--body)}
   .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .fetch-row{display:grid;grid-template-columns:1fr auto auto;gap:8px;margin-bottom:10px}
+  .fetch-row input,.fetch-row select{background:var(--ground);border:1px solid var(--line);color:var(--txt);border-radius:7px;padding:9px 11px;font-family:var(--mono);font-size:12.5px;outline:none}
+  .fetch-row input:focus,.fetch-row select:focus{border-color:var(--blue)}
+  .fetch-row button{padding:9px 16px}
+  .fetch-status{font-size:11.5px;color:var(--faint);margin-bottom:10px;min-height:16px;font-family:var(--mono)}
+  .fetch-status.ok{color:var(--blue)}
+  .fetch-status.err{color:#e8a49c}
+  .streaming{opacity:.85;position:relative}
+  .streaming::after{content:"▊";display:inline-block;color:var(--blue);animation:blink 1s steps(2) infinite;margin-left:2px}
+  @keyframes blink{50%{opacity:0}}
   textarea#cti{width:100%;min-height:360px;resize:vertical;line-height:1.55;padding:14px}
   .input-actions{display:flex;gap:10px;margin-top:14px;flex-wrap:wrap;align-items:center}
   button{font-family:var(--display);letter-spacing:.05em;cursor:pointer;border:none;border-radius:7px;font-size:13px;transition:transform .08s,background .15s,opacity .15s}
@@ -129,7 +139,16 @@
     </details>
 
     <div class="col-label">CTI 報告內容</div>
-    <textarea id="cti" spellcheck="false" placeholder="貼上一份 CTI 報告的正文（威脅分析、攻擊鏈描述、IOC、使用工具等）。"></textarea>
+    <div class="fetch-row">
+      <input id="ctiUrl" spellcheck="false" placeholder="或貼上 CTI 報告網址（https://...）">
+      <select id="fetcher" title="抓取方式">
+        <option value="jina">Jina Reader（推薦，回傳乾淨 Markdown）</option>
+        <option value="direct">直接抓取（多數網站會被 CORS 擋）</option>
+      </select>
+      <button class="btn-ghost" id="fetchBtn">抓取</button>
+    </div>
+    <div id="fetchStatus" class="fetch-status"></div>
+    <textarea id="cti" spellcheck="false" placeholder="貼上一份 CTI 報告的正文，或用上方欄位輸入網址自動抓取。"></textarea>
     <div class="input-actions">
       <button class="btn-primary" id="run">生成紅藍隊腳本</button>
       <button class="btn-ghost" id="sample">載入範例（CrazyHunter 摘要）</button>
@@ -216,17 +235,23 @@ function buildUserMsg(cti){
   return '<cti_report>\n'+cti+'\n</cti_report>\n\nAnalyze the report and return the JSON described. Respond in Traditional Chinese for all natural-language fields; keep ATT&CK IDs, technique names, atomic references, data-source names, and all code/command/query fields in their normal technical form. Parameterize every target/host/credential as <VARIABLE>.';
 }
 
-async function callLLM(cti){
+async function* streamLLM(cti){
   const base=baseUrl.value.trim().replace(/\/$/,''),key=apiKey.value.trim(),mdl=model.value.trim();
   const userMsg=buildUserMsg(cti);
-  if(provider.value==='anthropic'){
+  const prov=provider.value;
+
+  if(prov==='anthropic'){
     const res=await fetch(base+'/v1/messages',{method:'POST',
       headers:{'content-type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
-      body:JSON.stringify({model:mdl,max_tokens:8192,system:SYS_PROMPT,messages:[{role:'user',content:userMsg}]})});
+      body:JSON.stringify({model:mdl,max_tokens:8192,stream:true,system:SYS_PROMPT,messages:[{role:'user',content:userMsg}]})});
     if(!res.ok)throw new Error('HTTP '+res.status+' — '+(await res.text()).slice(0,300));
-    const data=await res.json();
-    return (data.content||[]).filter(b=>b.type==='text').map(b=>b.text).join('\n');
-  }else if(provider.value==='gemini'){
+    for await(const evt of sseEvents(res.body)){
+      if(evt.event==='content_block_delta'){
+        try{const d=JSON.parse(evt.data); if(d.delta?.text) yield d.delta.text;}catch{}
+      }
+    }
+  } else if(prov==='gemini'){
+    // Gemini 的 SSE 在瀏覽器端相容性不穩,改用非串流 generateContent (穩定,但無邊產邊顯示)
     const url=base+'/v1beta/models/'+encodeURIComponent(mdl)+':generateContent';
     const res=await fetch(url,{method:'POST',
       headers:{'content-type':'application/json','x-goog-api-key':key},
@@ -238,25 +263,91 @@ async function callLLM(cti){
     if(!res.ok)throw new Error('HTTP '+res.status+' — '+(await res.text()).slice(0,300));
     const data=await res.json();
     const c=data.candidates?.[0];
-    if(!c)throw new Error('Gemini 未回傳候選內容（可能被安全過濾攔截或金鑰無效）');
-    return (c.content?.parts||[]).map(p=>p.text||'').join('\n');
-  }else{
+    if(!c){
+      const block=data.promptFeedback?.blockReason;
+      throw new Error('Gemini 未回傳候選內容'+(block?'（被安全過濾攔截：'+block+'）':'（可能金鑰無效或請求被拒）'));
+    }
+    const finish=c.finishReason;
+    if(finish==='MAX_TOKENS')throw new Error('Gemini 因輸出達 max_tokens 上限而截斷，請縮短 CTI 或改用 gemini-2.5-pro');
+    if(finish==='SAFETY'||finish==='RECITATION')throw new Error('Gemini 因安全過濾終止輸出（'+finish+'）');
+    const t=(c.content?.parts||[]).map(p=>p.text||'').join('');
+    if(!t)throw new Error('Gemini 回傳空內容 (finishReason: '+(finish||'unknown')+')');
+    yield t;
+  } else {
+    // openai / local
     const url=base.endsWith('/v1')?base+'/chat/completions':base+'/v1/chat/completions';
     const headers={'content-type':'application/json'};
     if(key)headers['authorization']='Bearer '+key;
-    const res=await fetch(url,{method:'POST',headers,
-      body:JSON.stringify({model:mdl,max_tokens:8192,messages:[{role:'system',content:SYS_PROMPT},{role:'user',content:userMsg}]})});
+    const body={model:mdl,max_tokens:8192,stream:true,messages:[{role:'system',content:SYS_PROMPT},{role:'user',content:userMsg}]};
+    if(prov==='openai') body.response_format={type:'json_object'};
+    const res=await fetch(url,{method:'POST',headers,body:JSON.stringify(body)});
     if(!res.ok)throw new Error('HTTP '+res.status+' — '+(await res.text()).slice(0,300));
-    const data=await res.json();
-    return data.choices?.[0]?.message?.content||'';
+    for await(const evt of sseEvents(res.body)){
+      if(!evt.data||evt.data==='[DONE]')continue;
+      try{const d=JSON.parse(evt.data); const t=d.choices?.[0]?.delta?.content; if(t)yield t;}catch{}
+    }
   }
 }
+
+async function* sseEvents(stream){
+  const reader=stream.getReader(),dec=new TextDecoder();
+  let buf='';
+  while(true){
+    const {value,done}=await reader.read();
+    if(done)break;
+    buf+=dec.decode(value,{stream:true});
+    let idx;
+    while((idx=buf.indexOf('\n\n'))>=0){
+      const chunk=buf.slice(0,idx); buf=buf.slice(idx+2);
+      const evt={event:'message',data:''};
+      for(const line of chunk.split('\n')){
+        if(line.startsWith('data:')) evt.data+=(evt.data?'\n':'')+line.slice(5).trimStart();
+        else if(line.startsWith('event:')) evt.event=line.slice(6).trim();
+      }
+      if(evt.data) yield evt;
+    }
+  }
+}
+
 function extractJSON(txt){
   let t=txt.trim().replace(/^```(?:json)?/i,'').replace(/```$/,'').trim();
   const a=t.indexOf('{'),b=t.lastIndexOf('}');
   if(a>=0&&b>a)t=t.slice(a,b+1);
   return JSON.parse(t);
 }
+
+// --- URL fetch ---
+async function fetchCTI(url,mode){
+  if(mode==='jina'){
+    const target='https://r.jina.ai/'+url;
+    const res=await fetch(target,{headers:{'Accept':'text/plain'}});
+    if(!res.ok) throw new Error('Jina Reader HTTP '+res.status);
+    return await res.text();
+  } else {
+    const res=await fetch(url);
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const html=await res.text();
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    doc.querySelectorAll('script,style,nav,header,footer,aside').forEach(n=>n.remove());
+    return (doc.body?.innerText||doc.body?.textContent||'').replace(/\n{3,}/g,'\n\n').trim();
+  }
+}
+$('#fetchBtn').addEventListener('click',async()=>{
+  const url=$('#ctiUrl').value.trim(),mode=$('#fetcher').value,st=$('#fetchStatus');
+  if(!url){st.textContent='請填入網址。';st.className='fetch-status err';return;}
+  if(!/^https?:\/\//i.test(url)){st.textContent='網址需以 http:// 或 https:// 開頭。';st.className='fetch-status err';return;}
+  st.textContent='抓取中……';st.className='fetch-status';
+  $('#fetchBtn').disabled=true;
+  try{
+    const text=await fetchCTI(url,mode);
+    if(!text||text.length<50)throw new Error('抓到的內容過短，可能被封鎖或需要登入');
+    $('#cti').value=text;
+    st.textContent='✓ 已載入 '+text.length.toLocaleString()+' 字。';st.className='fetch-status ok';
+  }catch(e){
+    st.textContent='抓取失敗：'+e.message+'。'+(mode==='direct'?'多數網站會擋直接抓取，請試 Jina Reader。':'');
+    st.className='fetch-status err';
+  }finally{$('#fetchBtn').disabled=false;}
+});
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function codeBlock(q){
   if(!q||!q.code)return '';
@@ -306,14 +397,24 @@ function exportMarkdown(){
 $('#run').addEventListener('click',async()=>{
   const cti=$('#cti').value.trim(),out=$('#out'),d=DEFAULTS[provider.value];
   if(!baseUrl.value.trim()||!model.value.trim()||(!d.keyOptional&&!apiKey.value.trim())){$('#cfg').open=true;out.innerHTML='<div class="status err">請先填好 API 設定（Base URL、模型'+(d.keyOptional?'':'、金鑰')+'）。</div>';return;}
-  if(!cti){out.innerHTML='<div class="status err">請貼上一份 CTI 報告內容。</div>';return;}
-  $('#run').disabled=true;out.innerHTML='<div class="status"><span class="spinner"></span>正在分析報告並生成紅藍隊腳本……（CTI 較長時可能需要數十秒）</div>';
+  if(!cti){out.innerHTML='<div class="status err">請貼上一份 CTI 報告內容，或用網址欄位抓取。</div>';return;}
+  $('#run').disabled=true;
+  out.innerHTML='<div class="status streaming" id="live"><span class="spinner"></span>連線中……</div>';
+  const live=$('#live');
+  let acc='',t0=Date.now();
   try{
-    const raw=await callLLM(cti);let parsed;
-    try{parsed=extractJSON(raw);}catch(e){out.innerHTML='<div class="status err">模型未回傳可解析的 JSON。原始回應開頭：\n\n'+esc(raw.slice(0,600))+'</div>';$('#run').disabled=false;return;}
+    for await(const chunk of streamLLM(cti)){
+      acc+=chunk;
+      const secs=((Date.now()-t0)/1000).toFixed(1);
+      live.innerHTML='<span class="spinner"></span>生成中 · '+acc.length.toLocaleString()+' 字 · '+secs+'s';
+    }
+    let parsed;
+    try{parsed=extractJSON(acc);}
+    catch(e){out.innerHTML='<div class="status err">模型未回傳可解析的 JSON。原始回應開頭：\n\n'+esc(acc.slice(0,800))+'</div>';$('#run').disabled=false;return;}
     render(parsed);
-  }catch(err){out.innerHTML='<div class="status err">呼叫失敗：'+esc(err.message)+'\n\n常見原因：Base URL 或模型名稱錯誤；本地模型未開放 CORS（Ollama 需設 OLLAMA_ORIGINS）；金鑰錯誤；或端點不支援瀏覽器直連。</div>';}
-  finally{$('#run').disabled=false;}
+  }catch(err){
+    out.innerHTML='<div class="status err">呼叫失敗：'+esc(err.message)+'\n\n常見原因：Base URL 或模型名稱錯誤；本地模型未開放 CORS（Ollama 需設 OLLAMA_ORIGINS）；金鑰錯誤；或端點不支援串流／瀏覽器直連。</div>';
+  }finally{$('#run').disabled=false;}
 });
 applyDefaults();
 </script>
